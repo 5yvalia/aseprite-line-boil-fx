@@ -1,6 +1,6 @@
 -- Aseprite Line Boil FX Beta 1.0 --
 -- SAFE MODE: refuse to run on canvases larger than 512x512 px
-local safe_mode = true
+local safe_mode = false
 local SAFE_MODE_MAX_WIDTH = 512
 local SAFE_MODE_MAX_HEIGHT = 512
 -- REFERENCES --
@@ -39,8 +39,8 @@ local MODIFIERS = {} -- Filled by the effect list section below. Each entry beco
 -----------------------------------------------------------------------
 -- EFFECT LIST --
 -----------------------------------------------------------------------
-local effect_boiling, effect_noise, effect_wave
-MODIFIERS[#MODIFIERS + 1] = { id = "boiling", label = "Boiling", apply = function(image, context) return effect_boiling(image, context) end }
+local effect_wobble, effect_noise, effect_wave
+MODIFIERS[#MODIFIERS + 1] = { id = "wobble",  label = "Wobble",  apply = function(image, context) return effect_wobble(image, context) end }
 MODIFIERS[#MODIFIERS + 1] = { id = "wave",    label = "Wave",    apply = function(image, context) return effect_wave(image, context) end }
 MODIFIERS[#MODIFIERS + 1] = { id = "noise",   label = "Noise",   apply = function(image, context) return effect_noise(image, context) end }
 
@@ -56,7 +56,7 @@ do
   local function blend(start_value, end_value, amount) return start_value + (end_value - start_value) * amount end
   local function round_to_nearest(number) return round_down(number + 0.5) end
 
-  local BOIL_BLOCK_SIZE = 1
+  local WOBBLE_BLOCK_SIZE = 1
 
   local function random_from_numbers(a, b, c)
     local scrambled = round_down(a) * 374761393 + round_down(b) * 668265263 + round_down(c) * 1442695041
@@ -153,7 +153,7 @@ do
   end
 
   -----------------------------------------------------------------------
-  -- EFFECT: BOILING --
+  -- EFFECT: WOBBLE --
   -----------------------------------------------------------------------
   local gradient_x, gradient_y
   local function build_gradient_grid()
@@ -188,7 +188,7 @@ do
     return blended_top + (blended_bottom - blended_top) * ease_y
   end
 
-  function effect_boiling(image, context)
+  function effect_wobble(image, context)
     local info = get_image_info(image, context.index)
     if not info then return image end
     local filled_pixels = get_filled_pixels(info, image)
@@ -201,7 +201,7 @@ do
     local angle_range = push_distance * 4 * math.pi
     local edge_margin = round_up(push_distance)
     local nearby_area = get_grown_area(info, edge_margin)
-    local block_size = larger(1, BOIL_BLOCK_SIZE)
+    local block_size = larger(1, WOBBLE_BLOCK_SIZE)
 
     local frame_offset_x = random_from_numbers(context.index, 11, 5) * 1024
     local frame_offset_y = random_from_numbers(context.index, 12, 5) * 1024
@@ -249,94 +249,35 @@ do
   -----------------------------------------------------------------------
   -- EFFECT: NOISE --
   -----------------------------------------------------------------------
-  local function get_distance_from_edge(info)
-    if info.distance_from_edge then return info.distance_from_edge, info.deepest_distance end
-
-    local filled_pixels, width = info.filled_pixels, info.width
-    local left, top, right, bottom = info.left, info.top, info.right, info.bottom
-    local distance_from_edge, deepest_distance = {}, 1
-
-    for y = top, bottom do
-      local row_start = y * width
-      for x = left, right do
-        distance_from_edge[row_start + x] = filled_pixels[row_start + x] and 1000000 or 0
-      end
-    end
-
-    for y = top, bottom do
-      local row_start = y * width
-      for x = left, right do
-        local key = row_start + x
-        local distance = distance_from_edge[key]
-        if distance > 0 then
-          local distance_left = (x > left) and distance_from_edge[key - 1] or 0
-          local distance_above = (y > top) and distance_from_edge[key - width] or 0
-          distance_from_edge[key] = smaller(distance, distance_left + 1, distance_above + 1)
-        end
-      end
-    end
-
-    for y = bottom, top, -1 do
-      local row_start = y * width
-      for x = right, left, -1 do
-        local key = row_start + x
-        local distance = distance_from_edge[key]
-        if distance > 0 then
-          local distance_right = (x < right) and distance_from_edge[key + 1] or 0
-          local distance_below = (y < bottom) and distance_from_edge[key + width] or 0
-          distance = smaller(distance, distance_right + 1, distance_below + 1)
-          distance_from_edge[key] = distance
-          if distance > deepest_distance then deepest_distance = distance end
-        end
-      end
-    end
-
-    info.distance_from_edge, info.deepest_distance = distance_from_edge, deepest_distance
-    return distance_from_edge, deepest_distance
-  end
-
   function effect_noise(image, context)
     local info = get_image_info(image, context.index)
     if not info then return image end
     local filled_pixels = get_filled_pixels(info, image)
     if info.filled_count == 0 then return image end
-    local distance_from_edge, deepest_distance = get_distance_from_edge(info)
 
-    local chance_to_move = blend(0.10, 0.90, context.density_ratio)
-    local biggest_shift = 1 + round_to_nearest(context.density_ratio * 2)
     local width, height = info.width, info.height
-    local random_seed = context.index * 8
-    local deepest_pixel_allowed = 1 + round_to_nearest((deepest_distance - 1) * context.intensity_ratio)
-    local shift_choices = biggest_shift * 2 + 1
+    local shake_amount = 1 + round_to_nearest(context.intensity_ratio * 2)
+    local copies = 1 + round_to_nearest((1 - context.density_ratio) * 9)
+    local shift_choices = shake_amount * 2 + 1
+    local random_seed = context.index * 64
 
-    -- Decide which pixels move and where they go (separate lists, one entry per moving pixel)
-    local from_x, from_y, to_x, to_y, colors, move_count = {}, {}, {}, {}, {}, 0
+    local result_image = Image(image.spec)
+    result_image:clear()
+
     for y = info.top, info.bottom do
       local row_start = y * width
       for x = info.left, info.right do
-        local distance = distance_from_edge[row_start + x]
-        if distance > 0 and distance <= deepest_pixel_allowed
-           and random_from_numbers(x, y, random_seed + 1) < chance_to_move then
-          local shift_x = round_down(random_from_numbers(x, y, random_seed + 2) * shift_choices) - biggest_shift
-          local shift_y = round_down(random_from_numbers(x, y, random_seed + 3) * shift_choices) - biggest_shift
-          if shift_x == 0 and shift_y == 0 then
-            shift_x = (random_from_numbers(x, y, random_seed + 4) < 0.5) and -1 or 1
+        local color = filled_pixels[row_start + x]
+        if color then
+          for copy = 1, copies do
+            local shift_x = round_down(random_from_numbers(x, y, random_seed + copy * 2) * shift_choices) - shake_amount
+            local shift_y = round_down(random_from_numbers(x, y, random_seed + copy * 2 + 1) * shift_choices) - shake_amount
+            local new_x, new_y = x + shift_x, y + shift_y
+            if new_x >= 0 and new_x < width and new_y >= 0 and new_y < height then
+              result_image:putPixel(new_x, new_y, color)
+            end
           end
-          move_count = move_count + 1
-          from_x[move_count], from_y[move_count] = x, y
-          to_x[move_count], to_y[move_count] = x + shift_x, y + shift_y
-          colors[move_count] = filled_pixels[row_start + x]
         end
-      end
-    end
-
-    local result_image = Image(image)
-    local transparent_value = info.transparent_value
-    for i = 1, move_count do result_image:putPixel(from_x[i], from_y[i], transparent_value) end -- Lift pixels
-    for i = 1, move_count do -- Put them down in their new spot
-      local new_x, new_y = to_x[i], to_y[i]
-      if new_x >= 0 and new_y >= 0 and new_x < width and new_y < height then
-        result_image:putPixel(new_x, new_y, colors[i])
       end
     end
     return result_image
