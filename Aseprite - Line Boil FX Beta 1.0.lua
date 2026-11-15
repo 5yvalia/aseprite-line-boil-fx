@@ -1,6 +1,6 @@
 -- Aseprite Line Boil FX Beta 1.0 --
 -- SAFE MODE: refuse to run on canvases larger than 512x512 px
-local safe_mode = false
+local safe_mode = true
 local SAFE_MODE_MAX_WIDTH = 512
 local SAFE_MODE_MAX_HEIGHT = 512
 -- REFERENCES --
@@ -77,7 +77,7 @@ do
     local info = frame_index and image_info_cache[frame_index]
     if info and pixel_fingerprint and info.pixel_fingerprint == pixel_fingerprint
        and info.width == width and info.height == height and info.color_mode == color_mode then
-      return info.is_blank and nil or info
+      if info.is_blank then return nil end return info
     end
 
     local transparent_value = (color_mode == ColorMode.INDEXED) and image.spec.transparentColor or 0
@@ -95,7 +95,7 @@ do
     end
 
     if frame_index and pixel_fingerprint then image_info_cache[frame_index] = info end
-    return info.is_blank and nil or info
+    if info.is_blank then return nil end return info
   end
 
   local function get_filled_pixels(info, image)
@@ -248,35 +248,117 @@ do
 
   -----------------------------------------------------------------------
   -- EFFECT: NOISE --
+  -- Each output pixel either keeps its own color or, with a chance set by
+  -- Density, borrows the color of a random neighbor within Intensity pixels.
+  -- Lines wiggle without gaining weight on average.
   -----------------------------------------------------------------------
-  function effect_noise(image, context)
-    local info = get_image_info(image, context.index)
-    if not info then return image end
-    local filled_pixels = get_filled_pixels(info, image)
-    if info.filled_count == 0 then return image end
+  local NOISE_LCG_MUL, NOISE_LCG_ADD = 6364136223846793005, 1442695040888963407
+  local NOISE_CHUNK = 1024
+  local noise_formats = {}
 
-    local width, height = info.width, info.height
-    local shake_amount = 1 + round_to_nearest(context.intensity_ratio * 2)
-    local copies = 1 + round_to_nearest((1 - context.density_ratio) * 9)
+  local function noise_format(unit, count)
+    local key = unit .. count
+    local format = noise_formats[key]
+    if not format then
+      format = "<" .. string.rep(unit, count)
+      noise_formats[key] = format
+    end
+    return format
+  end
+
+  function effect_noise(image, context)
+    local bounds = image:shrinkBounds()
+    if bounds.isEmpty then return image end
+
+    local width, height, color_mode = image.width, image.height, image.colorMode
+
+    local unit, bytes_per_pixel, empty, alpha_mask
+    if color_mode == ColorMode.RGB then unit, bytes_per_pixel, empty, alpha_mask = "I4", 4, 0, 0xFF000000
+    elseif color_mode == ColorMode.GRAY then unit, bytes_per_pixel, empty, alpha_mask = "I2", 2, 0, 0xFF00
+    else unit, bytes_per_pixel, empty, alpha_mask = "B", 1, image.spec.transparentColor, 0xFF end
+
+    local shake_amount = 1 + round_to_nearest(context.intensity_ratio * 2) -- Max pixels a color can be borrowed from
+    local chance = blend(0.10, 0.60, context.density_ratio) -- Share of pixels that get disturbed
+    local chance_threshold = chance * 65536
     local shift_choices = shake_amount * 2 + 1
-    local random_seed = context.index * 64
+
+    local left, top = bounds.x, bounds.y
+    local right, bottom = left + bounds.width - 1, top + bounds.height - 1
+    local out_left, out_top = larger(0, left - shake_amount), larger(0, top - shake_amount)
+    local out_right, out_bottom = smaller(width - 1, right + shake_amount), smaller(height - 1, bottom + shake_amount)
+    local out_width, out_height = out_right - out_left + 1, out_bottom - out_top + 1
+
+    -- Read the source pixels into a lookup (key = y * width + x)
+    local grid = {}
+    local source_bytes = image.bytes
+    local unpack_pixels = string.unpack
+    for y = top, bottom do
+      local byte_position = (y * width + left) * bytes_per_pixel + 1
+      for chunk_start = 0, bounds.width - 1, NOISE_CHUNK do
+        local count = smaller(NOISE_CHUNK, bounds.width - chunk_start)
+        local row = { unpack_pixels(noise_format(unit, count), source_bytes, byte_position + chunk_start * bytes_per_pixel) }
+        local base_x = left + chunk_start
+        for i = 1, count do
+          local color = row[i]
+          if ((color ~ empty) & alpha_mask) ~= 0 then grid[y * width + base_x + i - 1] = color end
+        end
+      end
+    end
+
+    -- Each output pixel either keeps its own color, or borrows one from a random neighbor
+    local out = {}
+    for i = 1, out_width * out_height do out[i] = empty end
+
+    local state = context.index * 2654435761 + 1
+    local mul, add = NOISE_LCG_MUL, NOISE_LCG_ADD
+    for y = out_top, out_bottom do
+      local out_row = (y - out_top) * out_width - out_left + 1
+      for x = out_left, out_right do
+        local source_x, source_y = x, y
+        state = state * mul + add
+        local r = state >> 32
+        if (r & 0xFFFF) < chance_threshold then
+          state = state * mul + add
+          local r2 = state >> 32
+          local try_x = x + (((r2 & 0xFFFF) * shift_choices) >> 16) - shake_amount
+          local try_y = y + ((((r2 >> 16) & 0xFFFF) * shift_choices) >> 16) - shake_amount
+          if try_x >= 0 and try_x < width and try_y >= 0 and try_y < height then
+            source_x, source_y = try_x, try_y
+          end
+        end
+        local color = grid[source_y * width + source_x]
+        if color then out[out_row + x] = color end
+      end
+    end
 
     local result_image = Image(image.spec)
     result_image:clear()
 
-    for y = info.top, info.bottom do
-      local row_start = y * width
-      for x = info.left, info.right do
-        local color = filled_pixels[row_start + x]
-        if color then
-          for copy = 1, copies do
-            local shift_x = round_down(random_from_numbers(x, y, random_seed + copy * 2) * shift_choices) - shake_amount
-            local shift_y = round_down(random_from_numbers(x, y, random_seed + copy * 2 + 1) * shift_choices) - shake_amount
-            local new_x, new_y = x + shift_x, y + shift_y
-            if new_x >= 0 and new_x < width and new_y >= 0 and new_y < height then
-              result_image:putPixel(new_x, new_y, color)
-            end
-          end
+    local pack_pixels, unpack_table = string.pack, table.unpack
+    local empty_pixel = pack_pixels("<" .. unit, empty)
+    local empty_row = string.rep(empty_pixel, width)
+    local left_padding = string.rep(empty_pixel, out_left)
+    local right_padding = string.rep(empty_pixel, width - 1 - out_right)
+
+    local parts = { string.rep(empty_row, out_top) }
+    for row_number = 0, out_height - 1 do
+      local row_start = row_number * out_width
+      parts[#parts + 1] = left_padding
+      for chunk_start = 0, out_width - 1, NOISE_CHUNK do
+        local count = smaller(NOISE_CHUNK, out_width - chunk_start)
+        parts[#parts + 1] = pack_pixels(noise_format(unit, count),
+          unpack_table(out, row_start + chunk_start + 1, row_start + chunk_start + count))
+      end
+      parts[#parts + 1] = right_padding
+    end
+    parts[#parts + 1] = string.rep(empty_row, height - 1 - out_bottom)
+
+    local wrote_bytes = pcall(function() result_image.bytes = table.concat(parts) end)
+    if not wrote_bytes then
+      for i = 1, out_width * out_height do
+        local color = out[i]
+        if ((color ~ empty) & alpha_mask) ~= 0 then
+          result_image:putPixel(out_left + (i - 1) % out_width, out_top + (i - 1) // out_width, color)
         end
       end
     end
@@ -290,8 +372,8 @@ do
     local info = get_image_info(image, context.index)
     if not info then return image end
 
-    local wave_length = blend(32, 8, context.density_ratio) -- Rows per full wave
-    local wave_height = blend(1, 5, context.intensity_ratio) -- How many pixels it sways sideways
+    local wave_length = blend(32, 8, context.density_ratio)
+    local wave_height = blend(1, 5, context.intensity_ratio)
     local wave_start = (context.total <= 1) and math.pi / 2
                        or FULL_CIRCLE * (context.index - 1) / context.total + math.pi / 4 -- One full cycle across the frames
 
@@ -677,12 +759,14 @@ if #MODIFIERS > 0 then
 end
 
 -- OPTIONS
-dlg:newrow():label{ id="option_intensity_label", text="Density" }
-:slider{ id="option_intensity", min=MIN_INTENSITY, max=MAX_INTENSITY, value=intensity,
-  onchange=function() intensity = dlg.data.option_intensity build_preview_cache() dlg:repaint() end }
+dlg:newrow()
+:label{ id="option_intensity_label", text="Intensity", hexpand=true }
+:label{ id="option_density_label", text="Density", hexpand=true }
 
-dlg:newrow():label{ id="option_density_label", text="Intensity" }
-:slider{ id="option_density", min=MIN_DENSITY, max=MAX_DENSITY, value=density,
+dlg:newrow()
+:slider{ id="option_intensity", min=MIN_INTENSITY, max=MAX_INTENSITY, value=intensity, hexpand=true,
+  onchange=function() intensity = dlg.data.option_intensity build_preview_cache() dlg:repaint() end }
+:slider{ id="option_density", min=MIN_DENSITY, max=MAX_DENSITY, value=density, hexpand=true,
   onchange=function() density = dlg.data.option_density build_preview_cache() dlg:repaint() end }
 
 dlg:newrow():label{ id="option_animation_fps_label", text="Animation Speed (FPS)" }
